@@ -1,0 +1,56 @@
+# Builds sockudo for Ubuntu 22.04 and publishes it as a GitHub release (see MONOTREE.md).
+name: Monotree build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # jammy's glibc (2.35); upstream's release builds need 2.39
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: monotree-${{ hashFiles('Cargo.lock') }}
+          restore-keys: monotree-
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler
+
+      # pusher protocol, apps in mysql, webhook queue in redis
+      - name: Build
+        run: cargo build --release --locked -p sockudo --no-default-features --features local,mysql,redis
+
+      - name: Check it runs on jammy
+        run: |
+          strip target/release/sockudo
+          newest=$(strings target/release/sockudo | grep -oE 'GLIBC_2\.[0-9]+' | sort -t. -k2 -n -u | tail -1)
+          echo "newest glibc symbol: $newest"
+          [ "$(printf '%s\nGLIBC_2.35\n' "$newest" | sort -V | tail -1)" = "GLIBC_2.35" ]
+          target/release/sockudo --version || true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short=$(git rev-parse --short=12 HEAD)
+          tag="mono-$short"
+          cp target/release/sockudo sockudo
+          sha256sum sockudo > sockudo.sha256
+          gh release create "$tag" sockudo sockudo.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes "Built from $GITHUB_SHA on ubuntu-22.04 with \`--no-default-features --features local,mysql,redis\`. Linux x86_64, glibc ≤ 2.35."
