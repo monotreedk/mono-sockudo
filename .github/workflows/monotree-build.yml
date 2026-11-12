@@ -1,4 +1,4 @@
-# Builds sockudo for Ubuntu 22.04 and publishes it as a GitHub release (see MONOTREE.md).
+# Builds sockudo for Ubuntu 22.04 and Apple Silicon macOS and publishes both as one GitHub release (see MONOTREE.md).
 name: Monotree build
 
 on:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  linux:
     # jammy's glibc (2.35); upstream's release builds need 2.39
     runs-on: ubuntu-22.04
     steps:
@@ -22,8 +22,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: monotree-${{ hashFiles('Cargo.lock') }}
-          restore-keys: monotree-
+          key: monotree-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: monotree-${{ runner.os }}-
 
       - name: Build dependencies
         run: |
@@ -42,15 +42,73 @@ jobs:
           [ "$(printf '%s\nGLIBC_2.35\n' "$newest" | sort -V | tail -1)" = "GLIBC_2.35" ]
           target/release/sockudo --version || true
 
+      - run: |
+          cp target/release/sockudo sockudo
+          sha256sum sockudo > sockudo.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: sockudo*
+
+  darwin:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: monotree-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: monotree-${{ runner.os }}-
+
+      - name: Build dependencies
+        run: brew install protobuf cmake
+
+      - name: Build
+        run: cargo build --release --locked -p sockudo --no-default-features --features local,mysql,redis
+
+      - name: Check it runs
+        run: |
+          strip target/release/sockudo
+          file target/release/sockudo | grep -q arm64
+          # only system libraries, so it runs on a Mac without Homebrew
+          otool -L target/release/sockudo
+          ! otool -L target/release/sockudo | tail -n +2 | grep -vE '^\s+/(usr/lib|System)/'
+          otool -l target/release/sockudo | grep -A3 LC_BUILD_VERSION
+          target/release/sockudo --version
+
+      - run: |
+          cp target/release/sockudo sockudo-darwin-arm64
+          shasum -a 256 sockudo-darwin-arm64 > sockudo-darwin-arm64.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin
+          path: sockudo-darwin-arm64*
+
+  # one job creates the release, so both builds land in it or neither does
+  release:
+    needs: [linux, darwin]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          short=$(git rev-parse --short=12 HEAD)
-          tag="mono-$short"
-          cp target/release/sockudo sockudo
-          sha256sum sockudo > sockudo.sha256
-          gh release create "$tag" sockudo sockudo.sha256 \
+          tag="mono-${GITHUB_SHA::12}"
+          sha256sum -c sockudo.sha256 sockudo-darwin-arm64.sha256
+          gh release create "$tag" sockudo sockudo.sha256 sockudo-darwin-arm64 sockudo-darwin-arm64.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$tag" \
-            --notes "Built from $GITHUB_SHA on ubuntu-22.04 with \`--no-default-features --features local,mysql,redis\`. Linux x86_64, glibc ≤ 2.35."
+            --notes "Built from $GITHUB_SHA with \`--no-default-features --features local,mysql,redis\`. \`sockudo\`: Linux x86_64 on ubuntu-22.04, glibc ≤ 2.35. \`sockudo-darwin-arm64\`: macOS on Apple Silicon."
